@@ -1,6 +1,15 @@
 """
-Sapulpa mesh engine – runs inside the Android APK via Chaquopy.
-No Folium, no sockets, no ADB. Kotlin injects BLE RX and receives TX via bridge.
+Sapulpa multi-hop mesh – runs inside the APK (Chaquopy).
+
+Architecture
+------------
+  [Phone A BLE] ──► bridge node ──► virtual emulators ──► bridge node ──► [Phone B BLE]
+                         ▲                                    │
+                         └──── thousands of software hops ────┘
+
+The dense grid of SOFTWARE Bluetooth emulators carries packets across
+the whole Sapulpa map. Physical phones only attach at edge "bridge"
+nodes. No intermediate phones are required for the cross-town path.
 """
 
 from __future__ import annotations
@@ -10,9 +19,9 @@ import random
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
-bridge = None  # set from Kotlin
+bridge = None  # type: ignore
 
 
 def _log(msg: str) -> None:
@@ -35,10 +44,10 @@ SAPULPA_CENTER = (
     (SAPULPA_BOUNDS["min_lon"] + SAPULPA_BOUNDS["max_lon"]) / 2,
 )
 
-GRID_SPACING_M = 200.0
-BT_RANGE_M = 90.0
-HARDWARE_BRIDGE_COUNT = 4
-MAX_HOPS = 12
+GRID_SPACING_M = 120.0
+BT_RANGE_M = 100.0
+HARDWARE_BRIDGE_COUNT = 8
+MAX_HOPS = 40
 
 
 @dataclass
@@ -54,8 +63,8 @@ class MeshNode:
     def __post_init__(self) -> None:
         if not self.bd_addr:
             self.bd_addr = (
-                f"02:{random.randint(0,255):02X}:{random.randint(0,255):02X}:"
-                f"{random.randint(0,255):02X}:{random.randint(0,255):02X}:"
+                f"02:{random.randint(0, 255):02X}:{random.randint(0, 255):02X}:"
+                f"{random.randint(0, 255):02X}:{random.randint(0, 255):02X}:"
                 f"{self.node_id % 256:02X}"
             )
 
@@ -151,6 +160,7 @@ def flood(source: MeshNode, payload: bytes, max_hops: int = MAX_HOPS) -> dict:
     frontier = deque([source])
     hop = 0
     bridges_hit: List[int] = []
+    virtual_hops = 0
 
     while frontier and hop < max_hops:
         nxt: deque = deque()
@@ -167,11 +177,19 @@ def flood(source: MeshNode, payload: bytes, max_hops: int = MAX_HOPS) -> dict:
                             f'{{"from_node":{source.node_id},'
                             f'"bridge_node":{node.node_id},'
                             f'"bd_addr":"{node.bd_addr}",'
-                            f'"pkt_id":"{pkt_id}"}}'
+                            f'"pkt_id":"{pkt_id}",'
+                            f'"virtual_hops":{hop}}}'
                         )
                         bridge.on_tx(payload.hex(), meta)
+                        _log(
+                            f"BRIDGE→PHONE RF  node={node.node_id} "
+                            f"after {hop} virtual hops  "
+                            f"bd={node.bd_addr}"
+                        )
                     except Exception as e:
                         _log(f"bridge.on_tx error: {e}")
+            else:
+                virtual_hops += 1
             for neigh in node.neighbors:
                 if neigh.node_id not in visited:
                     nxt.append(neigh)
@@ -184,19 +202,24 @@ def flood(source: MeshNode, payload: bytes, max_hops: int = MAX_HOPS) -> dict:
         "total": len(_nodes),
         "hops": hop,
         "bridges": bridges_hit,
+        "virtual_hops": virtual_hops,
         "pkt_id": pkt_id,
     }
 
 
 def start_engine() -> str:
     global _nodes, _bridges, _running, _seen
-    _log("Building Sapulpa grid…")
+    _log("Building dense Sapulpa virtual mesh (software BLE emulators)…")
     _nodes = create_grid()
     edges = build_mesh(_nodes)
     _bridges = designate_bridges(_nodes)
     _seen.clear()
     _running = True
-    msg = f"Engine ready: {len(_nodes)} nodes, {edges} links, {len(_bridges)} bridges"
+    msg = (
+        f"READY: {len(_nodes)} software emulators, {edges} virtual links, "
+        f"{len(_bridges)} phone-bridge endpoints. "
+        f"Cross-town path = virtual hops only (no intermediate phones)."
+    )
     _log(msg)
     if bridge is not None:
         try:
@@ -222,11 +245,13 @@ def inject_message(text: str) -> str:
         return "engine not started"
     src = random.choice(_nodes)
     payload = text.encode("utf-8")[:40]
-    _log(f"Inject from node {src.node_id}: {text[:40]}")
+    _log(f"INJECT node={src.node_id} ({src.lat:.4f},{src.lon:.4f}): {text[:40]}")
     result = flood(src, payload)
     summary = (
-        f"Flood: src={result['source']} reached={result['reached']}/{result['total']} "
-        f"bridges={result['bridges']}"
+        f"CROSS-TOWN: src={result['source']} "
+        f"emulators_reached={result['reached']}/{result['total']} "
+        f"hops={result['hops']} "
+        f"phone_bridges={result['bridges']}"
     )
     _log(summary)
     return summary
@@ -243,21 +268,28 @@ def on_ble_rx(payload_hex: str, peer: str = "") -> str:
     if pkt_id in _seen:
         return "duplicate"
     _seen.add(pkt_id)
-    if len(_seen) > 2000:
+    if len(_seen) > 3000:
         _seen.clear()
-    bridge_node = random.choice(_bridges)
-    _log(f"BLE RX {len(payload)} B from {peer or '?'} → bridge {bridge_node.node_id}")
-    result = flood(bridge_node, payload)
-    return f"rx flood reached={result['reached']}"
+    entry = random.choice(_bridges)
+    _log(
+        f"PHONE→MESH  {len(payload)} B from {peer or '?'} "
+        f"enters bridge {entry.node_id} → virtual cross-town flood"
+    )
+    result = flood(entry, payload)
+    return f"rx ok: {result['reached']} emulators, bridges={result['bridges']}"
 
 
 def get_status() -> str:
     if not _nodes:
         return "idle"
-    return f"running nodes={len(_nodes)} bridges={len(_bridges)}"
+    return f"running emulators={len(_nodes)} bridges={len(_bridges)} mode=virtual-cross-town"
 
 
 def get_bridge_coords() -> str:
     if not _bridges:
         return ""
     return ";".join(f"{b.node_id},{b.lat},{b.lon}" for b in _bridges)
+
+
+def get_emulator_count() -> int:
+    return len(_nodes)

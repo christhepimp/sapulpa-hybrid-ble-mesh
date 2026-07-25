@@ -1,75 +1,55 @@
-# Sapulpa Hybrid BLE Mesh (Chaquopy)
+# Sapulpa Hybrid BLE Mesh
 
-**Single self-contained APK** that embeds the Python Sapulpa mesh engine and drives real BLE radio on the phone.
+**Cross-town multi-hop without intermediate phones.**
 
-- **No computer**
-- **No ADB**
-- **No Termux**
-- **No root**
-
-Python runs inside the app via [Chaquopy](https://chaquo.com/chaquopy/). When the simulated mesh reaches a bridge node, Kotlin broadcasts the payload with `BluetoothLeAdvertiser`. Scanned BLE packets are fed back into the Python engine.
-
----
-
-## Architecture
+Thousands of **software Bluetooth emulators** form a virtual mesh over the map of Sapulpa, Oklahoma. Data travels hop-by-hop through those emulators. Real phones only attach at edge **bridge** nodes over normal BLE — so packets can cross town even when no other phone is in the middle.
 
 ```
-┌─────────────────────────────────────────────┐
-│                 Android APK                 │
-│  ┌─────────────────┐    ┌────────────────┐  │
-│  │  Python         │◄──►│  Kotlin        │  │
-│  │  mesh_engine.py │    │  HybridMesh    │  │
-│  │  (Chaquopy)     │    │  Service       │  │
-│  │  Sapulpa grid   │    │  BLE Adv/Scan  │  │
-│  │  multi-hop flood│    │  Compose UI    │  │
-│  └─────────────────┘    └────────────────┘  │
-└─────────────────────────────────────────────┘
-              ▲ physical RF ▼
-         nearby phones / BLE devices
+  Phone A (BLE)                Phone B (BLE)
+       │                            ▲
+       ▼                            │
+  [bridge node] ── virtual ── [bridge node]
+       │         emulators         │
+       └──── thousands of hops ────┘
+              (no phones needed)
 ```
 
----
+## How it works
 
-## Build
+1. **On Start Hybrid**, Python (via Chaquopy) builds a dense GPS grid of software BLE nodes covering Sapulpa (~120 m spacing, ~100 m virtual range).
+2. Nodes within range become virtual neighbours (Haversine distance).
+3. Outermost nodes are marked **bridges** — the only ones allowed to use the phone’s real radio.
+4. You type a message → it is injected at a random emulator → **store-and-forward flood** across the virtual mesh.
+5. When a bridge is reached, Kotlin calls `BluetoothLeAdvertiser` so the **phone blasts the packet on real RF**.
+6. Another phone (or a BLE device) that scans it feeds the bytes back into *its* engine at a bridge → flood continues in software.
+
+**No intermediate phones. No internet. No ADB. No root.**
+
+## Build APK
 
 ```bash
 git clone https://github.com/christhepimp/sapulpa-hybrid-ble-mesh.git
 cd sapulpa-hybrid-ble-mesh/android
+# Open in Android Studio → Build → Build APK(s)
 ```
 
-Open **`android/`** in Android Studio (needs network once for Chaquopy + SDK).
-
-**Build → Build APK(s)** → install:
-
-```bash
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
-
-Chaquopy requires NDK ABIs (`arm64-v8a`, `x86_64`). First Gradle sync downloads the Python runtime into the APK (~30–50 MB larger).
-
----
+Requires one-time network for Chaquopy Python runtime (~30–50 MB in the APK).
 
 ## Use
 
-1. Open **Sapulpa Hybrid Mesh**
-2. Grant Bluetooth + Location (+ Notifications)
-3. Tap **Start Hybrid** — Python builds the Sapulpa grid and starts BLE
-4. Type a message → **Send** — floods the virtual mesh; bridge nodes trigger real BLE ads
-5. Nearby phones running the same app inject scanned packets back into their Python engines
-
----
+1. Install on one or more phones.
+2. **Start Hybrid** → watch log: `READY: N software emulators…`
+3. **Send** a short message → log shows virtual hops, then `BRIDGE→PHONE RF`.
+4. A second phone nearby can scan the BLE ad and inject into its own mesh.
 
 ## Key files
 
-| Path | Role |
+| File | Role |
 |------|------|
-| `app/src/main/python/mesh_engine.py` | Embedded Sapulpa grid + flood (Chaquopy) |
-| `…/PythonBridge.kt` | Kotlin ↔ Python method bridge |
-| `…/HybridMeshService.kt` | Foreground service, BLE, engine host |
-| `…/MainActivity.kt` | Compose dashboard |
-| `app/build.gradle.kts` | Chaquopy plugin + ABI filters |
-
----
+| `app/src/main/python/mesh_engine.py` | Dense Sapulpa emulator grid + multi-hop flood |
+| `PythonBridge.kt` | In-process Python ↔ Kotlin |
+| `HybridMeshService.kt` | BLE advertiser/scanner + engine host |
+| `MainActivity.kt` | Compose UI |
 
 ## License
 
