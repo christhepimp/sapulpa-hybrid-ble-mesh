@@ -1,55 +1,60 @@
 # Sapulpa Hybrid BLE Mesh
 
-**Cross-town multi-hop without intermediate phones.**
-
-Thousands of **software Bluetooth emulators** form a virtual mesh over the map of Sapulpa, Oklahoma. Data travels hop-by-hop through those emulators. Real phones only attach at edge **bridge** nodes over normal BLE — so packets can cross town even when no other phone is in the middle.
+**Cross-town messaging with fixed BLE relays + virtual emulators.**
 
 ```
-  Phone A (BLE)                Phone B (BLE)
-       │                            ▲
-       ▼                            │
-  [bridge node] ── virtual ── [bridge node]
-       │         emulators         │
-       └──── thousands of hops ────┘
-              (no phones needed)
+Phone ──BLE──► Fixed relay ──BLE──► Fixed relay ── … ──► Phone
+                  ▲                      ▲
+                  └── software emulators fill routing ──┘
 ```
 
-## How it works
+- **Virtual emulators** – dense software nodes over the whole Sapulpa map (multi-hop in the app).
+- **Fixed BLE relays** – planned GPS slots every **~80 m**. Put a real radio there (spare phone, Pi, ESP32) running this app.
+- When fixed relays form a continuous chain, **two phones anywhere along the chain can talk** without random people in the middle.
 
-1. **On Start Hybrid**, Python (via Chaquopy) builds a dense GPS grid of software BLE nodes covering Sapulpa (~120 m spacing, ~100 m virtual range).
-2. Nodes within range become virtual neighbours (Haversine distance).
-3. Outermost nodes are marked **bridges** — the only ones allowed to use the phone’s real radio.
-4. You type a message → it is injected at a random emulator → **store-and-forward flood** across the virtual mesh.
-5. When a bridge is reached, Kotlin calls `BluetoothLeAdvertiser` so the **phone blasts the packet on real RF**.
-6. Another phone (or a BLE device) that scans it feeds the bytes back into *its* engine at a bridge → flood continues in software.
+## Why fixed relays?
 
-**No intermediate phones. No internet. No ADB. No root.**
+Phone BLE only reaches ~30–80 m. Sapulpa is kilometers across.  
+So we mark a **grid of fixed positions**. Deploy cheap always-on BLE nodes at those coordinates. Packets hop:
 
-## Build APK
+`phone → fixed → fixed → … → fixed → phone`
+
+The app’s virtual mesh still runs the routing logic and can demo the full path in software even before all hardware is installed.
+
+## Numbers (default)
+
+| Setting | Value |
+|---------|--------|
+| Virtual emulator spacing | ~120 m |
+| Fixed relay spacing | **~80 m** (BLE-friendly) |
+| Virtual radio range | ~100 m |
+
+~80 m spacing over the configured bounds implies **on the order of a few thousand fixed slots** for full continuous coverage. You can raise `FIXED_RELAY_SPACING_M` in `mesh_engine.py` (e.g. 200–500 m) for a sparser backbone (fewer devices, possible gaps).
+
+## Build
 
 ```bash
 git clone https://github.com/christhepimp/sapulpa-hybrid-ble-mesh.git
 cd sapulpa-hybrid-ble-mesh/android
-# Open in Android Studio → Build → Build APK(s)
+# Android Studio → Build APK
 ```
 
-Requires one-time network for Chaquopy Python runtime (~30–50 MB in the APK).
+## Deploy
 
-## Use
+1. Install the APK on **user phones** (send/receive).
+2. Install the same APK (or a headless build) on **fixed devices** at each relay coordinate from `get_bridge_coords()` / log.
+3. Leave fixed devices powered and **Start Hybrid**.
+4. Phones join at the edges of the chain; data walks relay-to-relay across town.
 
-1. Install on one or more phones.
-2. **Start Hybrid** → watch log: `READY: N software emulators…`
-3. **Send** a short message → log shows virtual hops, then `BRIDGE→PHONE RF`.
-4. A second phone nearby can scan the BLE ad and inject into its own mesh.
+## Use on a phone
 
-## Key files
+1. **Start Hybrid** → log shows emulator count + fixed relay count.  
+2. **Send** a message → flood through virtual mesh; every fixed/bridge node triggers BLE TX.  
+3. Nearby fixed node or second phone scans → injects → continues the path.
 
-| File | Role |
-|------|------|
-| `app/src/main/python/mesh_engine.py` | Dense Sapulpa emulator grid + multi-hop flood |
-| `PythonBridge.kt` | In-process Python ↔ Kotlin |
-| `HybridMeshService.kt` | BLE advertiser/scanner + engine host |
-| `MainActivity.kt` | Compose UI |
+## Key file
+
+`app/src/main/python/mesh_engine.py` — grid, fixed-relay placement, flood, phone RF hooks.
 
 ## License
 
