@@ -1,117 +1,106 @@
 package com.sapulpa.blemesh
 
 import android.Manifest
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothManager
-import android.bluetooth.le.AdvertiseCallback
-import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
-import android.bluetooth.le.BluetoothLeAdvertiser
-import android.bluetooth.le.BluetoothLeScanner
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.ParcelUuid
-import android.util.Log
+import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.*
-import org.json.JSONObject
-import java.io.DataInputStream
-import java.io.DataOutputStream
-import java.net.ServerSocket
-import java.net.Socket
-import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Unrooted companion app for the Sapulpa Hybrid BLE Mesh.
- *
- * - Listens on a TCP port (default 5555) that is reached from the host via
- *   `adb forward tcp:5555 tcp:5555`.
- * - When a mesh packet arrives from Python, broadcasts it with
- *   BluetoothLeAdvertiser (no root, normal user-space BLE API).
- * - Continuously scans with BluetoothLeScanner; any interesting advertisement
- *   is tunnelled back to the Python mesh engine over the same socket.
- */
+/** Standalone Sapulpa BLE Mesh – no computer, no Python, no ADB. */
 class MainActivity : ComponentActivity() {
 
-    companion object {
-        private const val TAG = "SapulpaBleMesh"
-        private const val LISTEN_PORT = 5555
-        val MESH_SERVICE_UUID: UUID = UUID.fromString("0000sap1-0000-1000-8000-00805f9b34fb")
-    }
-
-    private var bluetoothAdapter: BluetoothAdapter? = null
-    private var advertiser: BluetoothLeAdvertiser? = null
-    private var scanner: BluetoothLeScanner? = null
-
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val running = AtomicBoolean(false)
-    private var serverJob: Job? = null
+    private var service: MeshForegroundService? = null
+    private var bound = false
 
     private val logLines = mutableStateListOf<String>()
-    private var bridgeStatus by mutableStateOf("Stopped")
-    private var lastTx by mutableStateOf("-")
-    private var lastRx by mutableStateOf("-")
+    private var nodeId by mutableStateOf("—")
+    private var bleState by mutableStateOf("Idle")
+    private var neighborCount by mutableIntStateOf(0)
+    private var messageText by mutableStateOf("")
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         if (results.values.all { it }) {
-            startBridge()
+            startAndBindService()
         } else {
-            appendLog("Bluetooth permissions denied")
+            logLines.add(0, "Permissions denied – mesh cannot start")
+        }
+    }
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val local = binder as MeshForegroundService.LocalBinder
+            service = local.getService()
+            bound = true
+            nodeId = service!!.engine.nodeId
+            service!!.onLog = { msg ->
+                runOnUiThread {
+                    logLines.add(0, msg)
+                    if (logLines.size > 300) logLines.removeLast()
+                }
+            }
+            service!!.onStateChanged = { s -> runOnUiThread { bleState = s } }
+            service!!.onNeighborChanged = { n -> runOnUiThread { neighborCount = n } }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            service = null
+            bound = false
+            bleState = "Disconnected"
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        val mgr = getSystemService(BluetoothManager::class.java)
-        bluetoothAdapter = mgr?.adapter
-        advertiser = bluetoothAdapter?.bluetoothLeAdvertiser
-        scanner = bluetoothAdapter?.bluetoothLeScanner
-
         setContent {
-            MaterialTheme {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    primary = Color(0xFF42A5F5),
+                    surface = Color(0xFF121212),
+                    background = Color(0xFF0A0A0A)
+                )
+            ) {
                 Surface(Modifier.fillMaxSize()) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text("Sapulpa Hybrid BLE Mesh", style = MaterialTheme.typography.headlineSmall)
-                        Spacer(Modifier.height(8.dp))
-                        Text("Bridge: $bridgeStatus")
-                        Text("Last TX (mesh→RF): $lastTx")
-                        Text("Last RX (RF→mesh): $lastRx")
-                        Spacer(Modifier.height(12.dp))
-                        Row {
-                            Button(onClick = { requestPermsAndStart() }) {
-                                Text("Start Bridge")
+                    MeshDashboard(
+                        nodeId = nodeId,
+                        bleState = bleState,
+                        neighborCount = neighborCount,
+                        logLines = logLines,
+                        messageText = messageText,
+                        onMessageChange = { messageText = it },
+                        onSend = {
+                            val t = messageText.trim()
+                            if (t.isNotEmpty()) {
+                                service?.sendMessage(t)
+                                messageText = ""
                             }
-                            Spacer(Modifier.width(8.dp))
-                            Button(onClick = { stopBridge() }) {
-                                Text("Stop")
-                            }
-                        }
-                        Spacer(Modifier.height(12.dp))
-                        Text("Log", style = MaterialTheme.typography.titleMedium)
-                        LazyColumn(Modifier.weight(1f)) {
-                            items(logLines) { line ->
-                                Text(line, style = MaterialTheme.typography.bodySmall)
-                            }
-                        }
-                    }
+                        },
+                        onStart = { requestPermsAndStart() },
+                        onStop = { stopMesh() }
+                    )
                 }
             }
         }
@@ -124,177 +113,102 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.BLUETOOTH_CONNECT,
             Manifest.permission.ACCESS_FINE_LOCATION
         )
+        if (Build.VERSION.SDK_INT >= 33) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
         val missing = needed.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (missing.isEmpty()) {
-            startBridge()
-        } else {
-            permissionLauncher.launch(missing.toTypedArray())
-        }
+        if (missing.isEmpty()) startAndBindService()
+        else permissionLauncher.launch(missing.toTypedArray())
     }
 
-    private fun startBridge() {
-        if (running.getAndSet(true)) return
-        if (bluetoothAdapter == null || !bluetoothAdapter!!.isEnabled) {
-            appendLog("Bluetooth not available / disabled")
-            running.set(false)
-            return
-        }
-        bridgeStatus = "Listening :$LISTEN_PORT"
-        appendLog("Starting TCP server on port $LISTEN_PORT")
-        startScanner()
-        serverJob = scope.launch {
-            try {
-                ServerSocket(LISTEN_PORT).use { server ->
-                    appendLog("ADB tunnel ready – waiting for Python engine…")
-                    while (running.get()) {
-                        val client = server.accept()
-                        appendLog("Python engine connected from ${client.inetAddress}")
-                        handleClient(client)
-                    }
-                }
-            } catch (e: Exception) {
-                appendLog("Server error: ${e.message}")
-                bridgeStatus = "Error"
-            }
-        }
+    private fun startAndBindService() {
+        val intent = Intent(this, MeshForegroundService::class.java)
+        ContextCompat.startForegroundService(this, intent)
+        bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        bleState = "Starting…"
     }
 
-    private fun stopBridge() {
-        running.set(false)
-        stopScanner()
-        stopAdvertising()
-        serverJob?.cancel()
-        bridgeStatus = "Stopped"
-        appendLog("Bridge stopped")
-    }
-
-    private suspend fun handleClient(socket: Socket) = withContext(Dispatchers.IO) {
-        try {
-            val input = DataInputStream(socket.getInputStream())
-            while (running.get() && !socket.isClosed) {
-                val len = input.readInt()
-                if (len <= 0 || len > 1_000_000) break
-                val buf = ByteArray(len)
-                input.readFully(buf)
-                val json = JSONObject(String(buf, Charsets.UTF_8))
-                when (json.optString("type")) {
-                    "mesh_to_rf" -> {
-                        val hex = json.optString("payload_b64")
-                        val payload = hexStringToByteArray(hex)
-                        val meta = json.optJSONObject("meta")
-                        appendLog("mesh→RF ${payload.size} B  meta=$meta")
-                        lastTx = "${payload.size} B"
-                        broadcastPayload(payload)
-                    }
-                    else -> appendLog("Unknown type ${json.optString("type")}")
-                }
-            }
-        } catch (e: Exception) {
-            appendLog("Client disconnected: ${e.message}")
-        } finally {
-            try { socket.close() } catch (_: Exception) {}
+    private fun stopMesh() {
+        service?.stopMesh()
+        if (bound) {
+            unbindService(connection)
+            bound = false
         }
-    }
-
-    private fun broadcastPayload(payload: ByteArray) {
-        val adv = advertiser ?: run {
-            appendLog("No BLE advertiser")
-            return
-        }
-        val data = payload.take(20).toByteArray()
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setConnectable(false)
-            .setTimeout(3000)
-            .build()
-        val advData = AdvertiseData.Builder()
-            .addServiceUuid(ParcelUuid(MESH_SERVICE_UUID))
-            .addServiceData(ParcelUuid(MESH_SERVICE_UUID), data)
-            .setIncludeDeviceName(false)
-            .build()
-        try {
-            adv.startAdvertising(settings, advData, advertiseCallback)
-            appendLog("Advertising ${data.size} B for 3 s")
-        } catch (e: SecurityException) {
-            appendLog("Advertise permission error: ${e.message}")
-        }
-    }
-
-    private val advertiseCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-            Log.d(TAG, "Advertise started")
-        }
-        override fun onStartFailure(errorCode: Int) {
-            appendLog("Advertise failed code=$errorCode")
-        }
-    }
-
-    private fun stopAdvertising() {
-        try {
-            advertiser?.stopAdvertising(advertiseCallback)
-        } catch (_: Exception) {}
-    }
-
-    private fun startScanner() {
-        val sc = scanner ?: return
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-        try {
-            sc.startScan(null, settings, scanCallback)
-            appendLog("BLE scanner started")
-        } catch (e: SecurityException) {
-            appendLog("Scan permission error: ${e.message}")
-        }
-    }
-
-    private fun stopScanner() {
-        try {
-            scanner?.stopScan(scanCallback)
-        } catch (_: Exception) {}
-    }
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult?) {
-            result ?: return
-            val record = result.scanRecord ?: return
-            val serviceData = record.getServiceData(ParcelUuid(MESH_SERVICE_UUID))
-            if (serviceData != null && serviceData.isNotEmpty()) {
-                lastRx = "${serviceData.size} B from ${result.device?.address}"
-                appendLog("RF→mesh ${serviceData.size} B  rssi=${result.rssi}")
-            }
-        }
-        override fun onScanFailed(errorCode: Int) {
-            appendLog("Scan failed code=$errorCode")
-        }
-    }
-
-    private fun appendLog(msg: String) {
-        Log.i(TAG, msg)
-        runOnUiThread {
-            logLines.add(0, msg)
-            if (logLines.size > 200) logLines.removeLast()
-        }
-    }
-
-    private fun hexStringToByteArray(s: String): ByteArray {
-        val len = s.length
-        val data = ByteArray(len / 2)
-        var i = 0
-        while (i < len) {
-            data[i / 2] = ((Character.digit(s[i], 16) shl 4)
-                    + Character.digit(s[i + 1], 16)).toByte()
-            i += 2
-        }
-        return data
+        stopService(Intent(this, MeshForegroundService::class.java))
+        bleState = "Stopped"
     }
 
     override fun onDestroy() {
-        stopBridge()
-        scope.cancel()
+        if (bound) {
+            unbindService(connection)
+            bound = false
+        }
         super.onDestroy()
+    }
+}
+
+@Composable
+fun MeshDashboard(
+    nodeId: String,
+    bleState: String,
+    neighborCount: Int,
+    logLines: List<String>,
+    messageText: String,
+    onMessageChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onStart: () -> Unit,
+    onStop: () -> Unit
+) {
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("Sapulpa BLE Mesh", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF90CAF9))
+        Text("Standalone · No internet · No computer", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        Spacer(Modifier.height(16.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            StatusChip("Node", nodeId, Modifier.weight(1f))
+            StatusChip("Peers", neighborCount.toString(), Modifier.weight(1f))
+        }
+        Spacer(Modifier.height(8.dp))
+        StatusChip("BLE", bleState, Modifier.fillMaxWidth())
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onStart, modifier = Modifier.weight(1f)) { Text("Start Mesh") }
+            OutlinedButton(onClick = onStop, modifier = Modifier.weight(1f)) { Text("Stop") }
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("Inject message into mesh", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = messageText,
+                onValueChange = onMessageChange,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Type a short message…") },
+                singleLine = true,
+                maxLines = 1
+            )
+            Button(onClick = onSend) { Text("Send") }
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("Live log", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(6.dp))
+        LazyColumn(
+            Modifier.weight(1f).fillMaxWidth().background(Color(0xFF1A1A1A), RoundedCornerShape(8.dp)).padding(8.dp)
+        ) {
+            items(logLines) { line ->
+                Text(line, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = Color(0xFFB0BEC5), modifier = Modifier.padding(vertical = 2.dp))
+            }
+        }
+    }
+}
+
+@Composable
+fun StatusChip(label: String, value: String, modifier: Modifier = Modifier) {
+    Surface(modifier = modifier, shape = RoundedCornerShape(8.dp), color = Color(0xFF1E1E1E)) {
+        Column(Modifier.padding(12.dp)) {
+            Text(label, fontSize = 11.sp, color = Color.Gray)
+            Text(value, fontWeight = FontWeight.SemiBold, color = Color.White)
+        }
     }
 }
